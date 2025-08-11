@@ -1,12 +1,20 @@
+# training
+dropout: 0.2
 num_classes: 2
 hidden_units: 128
-chebyshev_k: [1, 2]
 
-lr: 9e-3
-epochs: 3000
-weight_decay: 5e-4
+lr: 0.009
+epochs: 1000
+weight_decay: 0.0005
 early_stopping_patience: 100
 
-num_folds: 5
-device: auto
 seed: 42
+num_folds: 4
+device: "auto"
+
+# model-specific
+gat_heads: 1
+gat_dropout: 0.2
+gatv2_heads: 1
+gatv2_dropout: 0.2
+cheb_k: [1, 2]

@@ -1,27 +1,7 @@
 import os
-import yaml
 import torch
 import random
 import numpy as np
-
-from loguru import logger
-
-def load_config(config_path='config.yaml'):
-    """Load configuration from a YAML file.
-    """
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    if config.get('device') == 'auto':
-        config['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
-    elif config.get('device') not in ['cuda', 'cpu']:
-        logger.warning(f"Warning: Invalid device '{config.get('device')}' specified in config. Using 'cpu'.")
-        config['device'] = 'cpu'
-
-    config['lr'] = float(config['lr'])
-    config['weight_decay'] = float(config['weight_decay'])
-    
-    return config
 
 def seed_everything(seed):
     """Set random seed for reproducibility.
@@ -33,3 +13,27 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def df_to_markdown(df, index=False, scaling_factor=None, round_digits=None, str_max_len=None):
+    """Converts a DataFrame to a Markdown table.
+    """
+    df_copy = df.copy()
+    
+    if scaling_factor is not None:
+        numeric_cols = df_copy.select_dtypes(include=np.number).columns
+        df_copy[numeric_cols] = df_copy[numeric_cols] * scaling_factor
+    
+    if round_digits is not None:
+        df_copy = df_copy.round(round_digits)
+        
+    if str_max_len is not None:
+        for col in df_copy.select_dtypes(include=['object']):
+            df_copy[col] = df_copy[col].apply(
+                lambda x: x if len(str(x)) <= str_max_len else str(x)[:str_max_len] + '…'
+            )
+            
+    markdown_str = df_copy.to_markdown(index=index, tablefmt='pipe')
+    return markdown_str
+
+def md_print(df, index=False, str_max_len=4):
+    print(df_to_markdown(df, index=index, str_max_len=str_max_len))

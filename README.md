@@ -72,9 +72,3 @@ seed: 42
 
 - Python 3.8+
 - See requirements.txt for package dependencies
-
-## License
-
-MIT License
-
----

@@ -1,156 +1,125 @@
 import os
+import gc
 import torch
 import argparse
-import pandas as pd
+import warnings
+import numpy as np
+from sklearn.model_selection import train_test_split
 
-from src.utils import load_config, seed_everything
-from src.loader import load_dataset, data_to_pyg
-from src.models import *
-from src.train import train, test
+from src.config import Config
+from src.attack import Attack
+from src.dataloader import DataPreprocessor
+from src.models import load_pretrained, predict_for_ids
+from src.utils import seed_everything
 
-from sklearn.model_selection import StratifiedKFold
+os.environ['PYTHONWARNINGS'] = 'ignore'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
-from loguru import logger
+warnings.filterwarnings('ignore')
+
+MODEL_NAMES = ['GCN', 'GAT', 'GATv2', 'SAGE', 'Chebyshev']
 
 def main():
-    
-    # parse
-    parser = argparse.ArgumentParser(description="Train GNN models on graph datasets.")
-    parser.add_argument('-d', '--dataset', choices=['ammari', 'etfd'], default='ammari',
-                        help='Dataset to use: "ammari" or "etfd" (default: ammari)')
+    parser = argparse.ArgumentParser(description="Run evasion attacks on selected models.")
+
+    parser.add_argument('--models', type=str, nargs='+', default=MODEL_NAMES,
+                        help=f"List of model names to use. Choices: {', '.join(MODEL_NAMES)}. Default: {MODEL_NAMES}.")
+    parser.add_argument('--num_accounts', type=int, default=2,
+                        help="Number of accounts. Default: 2.")
+    parser.add_argument('--num_steps', type=int, default=2,
+                        help="Number of steps. Default: 2.")
+    parser.add_argument('--num_optim_steps', type=int, default=5,
+                        help="Number of optimization steps. Default: 5.")
+    parser.add_argument('--p_evasion_threshold', type=float, default=0.5,
+                        help="Evasion threshold probability. Default: 0.5.")
+    parser.add_argument('--gas_penalty', type=float, default=0.0,
+                        help="Gas penalty. Default: 0.0.")
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help="Path to configuration file. Default: config.yaml.")
     args = parser.parse_args()
 
-    # config
-    config = load_config()
-    hidden_units = config['hidden_units']
-    num_classes = config['num_classes']
-    num_folds = config.get('num_folds', 5)
-    device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
-    seed_everything(config['seed'])
+    config = Config.from_yaml(args.config)
     
-    print("Configuration:")
-    max_key_len = max(len(str(key)) for key in config.keys())
-    for key, value in config.items():
-        print(f"{key:<{max_key_len}} : {value}")
+    seed_everything(config.seed)
     
-    # load data
-    features, edges = load_dataset(args.dataset)
-    if num_folds == 1:
-        data = data_to_pyg(features, edges)
-    else:
-        data = data_to_pyg(features, edges, val_ratio=1.0/num_folds, test_ratio=0.0)
-    data.to(device)
-    num_features = data.num_features
-    logger.info('Graph data loaded successfully')
+    torch.set_float32_matmul_precision('high')
+    
+    device = config.get_device()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    n = args.num_accounts
+    steps = args.num_steps
+    optim_steps = args.num_optim_steps
+    gas_penalty = args.gas_penalty
+    p_evasion_threshold = args.p_evasion_threshold
 
-    # training
-    model_constructors = get_model_constructors(num_features, hidden_units, num_classes, config.get('chebyshev_k'))
+    print("Loading and preprocessing data...")
+    data = DataPreprocessor('etfd')
+    labels = data.node_labels
+    train_indices, val_indices = train_test_split(
+        np.arange(len(labels)), test_size=0.2, stratify=labels, random_state=config.seed
+    )
+    scam_val_ids = val_indices[labels[val_indices] == 1] # scams in validation set
 
-    results_dir = "results"
-    os.makedirs(results_dir, exist_ok=True)
-    results_path = os.path.join(results_dir, f"{args.dataset}_cv_results.csv")
+    num_features = len(data.feature_names)
+    edge_dim = data.edge_features.shape[1]
+    print(f"Dataset loaded: {len(data.node_labels)} nodes, {len(data.edge_features)} edges")
 
-    all_results_accumulator = []
+    model_names = args.models
 
-    for model_name, model_constructor in model_constructors.items():
-        logger.info(f"Processing model: {model_name}")
-
-        # single fold
-        if num_folds == 1:
-            logger.info(f"Performing a single run for {model_name} (num_folds=1)")
-            model_instance = model_constructor().to(device)
-            trained_model = train(config, model_instance, data) 
-            precision, recall, f1 = test(trained_model, data)
-            
-            all_results_accumulator.append({
-                "model": model_name, 
-                "fold": "N/A",
-                "precision": precision, 
-                "recall": recall, 
-                "f1": f1
-            })
-            logger.info(f"Finished single run for {model_name}. Test Results: Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
-            
-            model_instance.cpu()
-            torch.cuda.empty_cache()
-            continue
-
-        # cross-validation
-        logger.info(f"Starting {num_folds}-fold cross-validation for {model_name}")
+    for model_name in model_names:
+        print(f"\n{'='*60}")
+        print(f"Processing model: {model_name}")
+        print(f"{'='*60}")
         
-        original_train_indices = data.train_mask.nonzero(as_tuple=False).view(-1)
-        original_val_indices = data.val_mask.nonzero(as_tuple=False).view(-1)
-        
-        cv_node_indices = torch.cat([original_train_indices, original_val_indices]).unique()
-        cv_node_indices_np = cv_node_indices.cpu().numpy()
+        try:
+            model = load_pretrained(f'checkpoints_full/{model_name}.pth', num_features, edge_dim, config)
 
-        if len(cv_node_indices_np) < num_folds:
-            logger.warning(
-                f"Not enough nodes ({len(cv_node_indices_np)}) for {num_folds}-fold CV for model {model_name}. "
-                f"Skipping CV for this model. Minimum {num_folds} samples are required."
-            )
-            all_results_accumulator.append({
-                "model": model_name, "fold": f"skipped_low_samples ({len(cv_node_indices_np)}<{num_folds})", 
-                "precision": float('nan'), "recall": float('nan'), "f1": float('nan')
-            })
+            pred_probas = predict_for_ids(model, data.graph, scam_val_ids)
+            candidates_ids = np.where(pred_probas > 0.5)[0].tolist()
+            actual_node_ids = [int(scam_val_ids[i]) for i in candidates_ids[:n]]
+            
+            print(f"Found {len(actual_node_ids)} candidate accounts for attack")
+
+            results = []
+            for evading_id in actual_node_ids:
+                print('\n' + '=' * 40)
+                print(f'Running {model_name} on id {evading_id}')
+                print('=' * 40)
+
+                attack = Attack(model, data, evading_id)
+                result = attack.run(
+                    num_steps=steps,
+                    num_optim_steps=optim_steps,
+                    p_evasion_threshold=p_evasion_threshold,
+                    gas_penalty=gas_penalty
+                )
+                results.append(result)
+                
+                del attack
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Error processing model {model_name}: {str(e)}")
             continue
-
-        kf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=config['seed'])
-        y_cv = data.y[cv_node_indices].cpu().numpy()
-        model_fold_metrics = []
-
-        for fold_idx, (train_fold_local_indices, val_fold_local_indices) in enumerate(kf.split(cv_node_indices_np, y_cv)):
-            logger.info(f"Training {model_name} - Fold {fold_idx + 1}/{num_folds}")
-            
-            model_instance = model_constructor().to(device)
-            fold_data = data.clone()
-            fold_data.to(device)
-            
-            train_global_indices = cv_node_indices[train_fold_local_indices]
-            val_global_indices = cv_node_indices[val_fold_local_indices]
-
-            fold_data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
-            fold_data.val_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
-            fold_data.train_mask[train_global_indices] = True
-            fold_data.val_mask[val_global_indices] = True
-            
-            assert not (fold_data.train_mask & fold_data.val_mask).any(), "Train and Val masks overlap!"
-            assert not (fold_data.train_mask & fold_data.test_mask).any(), "Train and Test masks overlap!"
-            assert not (fold_data.val_mask & fold_data.test_mask).any(), "Val and Test masks overlap!"
-            
-            trained_model_fold = train(config, model_instance, fold_data)
-            precision, recall, f1 = test(trained_model_fold, fold_data, mask=fold_data.val_mask)
-            
-            model_fold_metrics.append({'precision': precision, 'recall': recall, 'f1': f1})
-            all_results_accumulator.append({
-                "model": model_name, 
-                "fold": fold_idx + 1,
-                "precision": precision, 
-                "recall": recall, 
-                "f1": f1
-            })
-            logger.info(f"Fold {fold_idx + 1}/{num_folds} for {model_name}: Test Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
-            
-            model_instance.cpu()
-            torch.cuda.empty_cache()
-
-        if model_fold_metrics:
-            avg_precision = sum(m['precision'] for m in model_fold_metrics) / num_folds
-            avg_recall = sum(m['recall'] for m in model_fold_metrics) / num_folds
-            avg_f1 = sum(m['f1'] for m in model_fold_metrics) / num_folds
-            
-            logger.info(f"Avg Test Results for {model_name} over {num_folds} folds: Precision={avg_precision:.4f}, Recall={avg_recall:.4f}, F1={avg_f1:.4f}")
-            all_results_accumulator.append({
-                "model": model_name,
-                "fold": "average",
-                "precision": avg_precision,
-                "recall": avg_recall,
-                "f1": avg_f1
-            })
-
-    results_df = pd.DataFrame(all_results_accumulator)
-    results_df.to_csv(results_path, index=False)
-    logger.info(f"Cross-validation results saved to {results_path}")
+        finally:
+            if 'model' in locals():
+                del model
+            if device.type == 'cuda':
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+            gc.collect()
+    
+    print(f"\n{'='*60}")
+    print("Attack analysis completed successfully!")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     main()
