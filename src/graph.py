@@ -1,7 +1,5 @@
 import torch
 import torch.nn.functional as F
-
-from copy import deepcopy
 from typing import Optional, List, Union, Callable, Dict, Any
 
 
@@ -16,11 +14,22 @@ class Graph:
             data: PyTorch Geometric Data object
             requires_grad: Whether to track gradients for node/edge features
         """
-        self.data = deepcopy(data)
+        if hasattr(data, 'clone'):
+            self.data = data.clone()
+        else:
+            import torch_geometric.data
+            self.data = torch_geometric.data.Data()
+            
+            # copy tensor attributes
+            for key in data.keys:
+                value = data[key]
+                if isinstance(value, torch.Tensor):
+                    self.data[key] = value.clone()
+                else:
+                    self.data[key] = value
+        
         self._requires_grad = requires_grad
-        self._num_nodes = self.data.x.shape[0]
-        self._cached_degrees = None
-        self._cached_adjacency = None
+        self._num_nodes = self.data.x.shape[0] if self.data.x is not None else 0
 
         if self._requires_grad:
             self._setup_gradients()
@@ -32,7 +41,7 @@ class Graph:
         if hasattr(self.data, 'edge_attr') and self.data.edge_attr is not None:
             self.data.edge_attr = self.data.edge_attr.detach().requires_grad_(True)
     
-    # ============= Properties =============
+    # ============= properties =============
     
     @property
     def x(self) -> Optional[torch.Tensor]:
@@ -67,7 +76,19 @@ class Graph:
         self.data.edge_attr = value
         if self._requires_grad and value is not None:
             self.data.edge_attr = self.data.edge_attr.detach().requires_grad_(True)
-    
+            
+    @property
+    def y(self) -> Optional[torch.Tensor]:
+        """Node labels."""
+        return getattr(self.data, 'y', None)
+
+    @y.setter
+    def y(self, value: Optional[torch.Tensor]):
+        """Set node labels with gradient tracking."""
+        self.data.y = value
+        if self._requires_grad and value is not None:
+            self.data.y = self.data.y.detach().requires_grad_(True)
+
     @property
     def num_nodes(self) -> int:
         """Number of nodes in the graph."""
@@ -88,7 +109,7 @@ class Graph:
         """Whether gradient tracking is enabled."""
         return self._requires_grad
     
-    # ============= Node Operations =============
+    # ============= node operations =============
     
     def add_node(self, features: Optional[torch.Tensor] = None) -> int:
         """
@@ -109,11 +130,9 @@ class Graph:
         
         self.x = torch.cat([self.x, features], dim=0)
         self._num_nodes += 1
-        
-        self._invalidate_caches()
-        
-        return self._num_nodes - 1
-    
+
+        return int(self._num_nodes - 1)
+
     def add_nodes(self, features: torch.Tensor) -> List[int]:
         """
         Add multiple nodes efficiently.
@@ -176,7 +195,7 @@ class Graph:
             return self.x[node_ids:node_ids+1]
         return self.x[node_ids]
     
-    # ============= Edge Operations =============
+    # ============= edge operations =============
     
     def add_edge(self, src: int, dst: int, features: Optional[torch.Tensor] = None):
         """
@@ -200,8 +219,6 @@ class Graph:
                 self.edge_attr = features
             else:
                 self.edge_attr = torch.cat([self.edge_attr, features], dim=0)
-        
-        self._invalidate_caches()
     
     def add_edges(self, edge_index: torch.Tensor, features: Optional[torch.Tensor] = None):
         """
@@ -222,7 +239,33 @@ class Graph:
             else:
                 self.edge_attr = torch.cat([self.edge_attr, features], dim=0)
     
-    # ============= Gradient Operations =============
+    def delete_edge(self, edge_idx: int):
+        """
+        Delete a specific edge by its index.
+        
+        Args:
+            edge_idx: Index of the edge to remove
+        """
+        if edge_idx < 0 or edge_idx >= self.num_edges:
+            raise ValueError(f"Invalid edge index {edge_idx}. Graph has {self.num_edges} edges.")
+        
+        # create mask to exclude the specified edge
+        edge_mask = torch.ones(self.num_edges, dtype=torch.bool, device=self.device)
+        edge_mask[edge_idx] = False
+        
+        # remove edge from edge_index
+        self.edge_index = self.edge_index[:, edge_mask]
+        
+        # remove corresponding edge attributes if they exist
+        if self.edge_attr is not None:
+            if self._requires_grad:
+                # maintain gradient tracking
+                new_edge_attr = self.edge_attr[edge_mask]
+                self.edge_attr = new_edge_attr
+            else:
+                self.edge_attr = self.edge_attr[edge_mask]
+    
+    # ============= gradient operations =============
     
     def compute_gradients(
         self,
@@ -313,7 +356,7 @@ class Graph:
         sig = inspect.signature(model.forward)
         return 'edge_attr' in sig.parameters or 'edge_weight' in sig.parameters
     
-    # ============= Utility Methods =============
+    # ============= utility methods =============
     
     def validate(self) -> bool:
         """Validate graph consistency."""
@@ -343,16 +386,43 @@ class Graph:
     
     def detach(self) -> 'Graph':
         """Create a detached copy without gradient tracking."""
-        detached_data = deepcopy(self.data)
-        if detached_data.x is not None:
-            detached_data.x = detached_data.x.detach()
-        if hasattr(detached_data, 'edge_attr') and detached_data.edge_attr is not None:
-            detached_data.edge_attr = detached_data.edge_attr.detach()
+        if hasattr(self.data, 'clone'):
+            detached_data = self.data.clone()
+            # detach all tensor attributes
+            for key in detached_data.keys:
+                if isinstance(detached_data[key], torch.Tensor):
+                    detached_data[key] = detached_data[key].detach()
+        else:
+            import torch_geometric.data
+            detached_data = torch_geometric.data.Data()
+
+            # copy tensor attributes
+            for key in self.data.keys:
+                value = self.data[key]
+                if isinstance(value, torch.Tensor):
+                    detached_data[key] = value.detach()
+                else:
+                    detached_data[key] = value
+        
         return Graph(detached_data, requires_grad=False)
     
     def clone(self) -> 'Graph':
         """Create a deep copy of the graph."""
-        return Graph(deepcopy(self.data), requires_grad=self._requires_grad)
+        if hasattr(self.data, 'clone'):
+            cloned_data = self.data.clone()
+        else:
+            import torch_geometric.data
+            cloned_data = torch_geometric.data.Data()
+            
+            # copy tensor attributes
+            for key in self.data.keys:
+                value = self.data[key]
+                if isinstance(value, torch.Tensor):
+                    cloned_data[key] = value.clone()
+                else:
+                    cloned_data[key] = value
+        
+        return Graph(cloned_data, requires_grad=self._requires_grad)
     
     def to(self, device: Union[str, torch.device]) -> 'Graph':
         """Move graph to specified device with proper memory alignment."""
@@ -365,8 +435,6 @@ class Graph:
         self.data = self.data.to(device)
         if self._requires_grad:
             self._setup_gradients()
-        
-        self._invalidate_caches()
         
         if device.type == 'cuda':
             torch.cuda.synchronize()
@@ -382,24 +450,6 @@ class Graph:
         if device is None:
             return self.to('cuda')
         return self.to(f'cuda:{device}')
-    
-    def _invalidate_caches(self):
-        """Invalidate cached computations when graph structure changes."""
-        self._cached_degrees = None
-        self._cached_adjacency = None
-    
-    def get_degrees(self, cache: bool = True) -> torch.Tensor:
-        """Get node degrees with optional caching for performance."""
-        if cache and self._cached_degrees is not None:
-            return self._cached_degrees
-        
-        degrees = torch.zeros(self.num_nodes, dtype=torch.long, device=self.device)
-        degrees = degrees.scatter_add_(0, self.edge_index[1], torch.ones_like(self.edge_index[1]))
-        
-        if cache:
-            self._cached_degrees = degrees
-        
-        return degrees
     
     def memory_usage(self) -> dict:
         """Get memory usage statistics for the graph."""

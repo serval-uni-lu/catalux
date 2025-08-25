@@ -1,59 +1,50 @@
 import torch
 import numpy as np
 import pandas as pd
-from typing import Tuple
-from copy import deepcopy
+from typing import Tuple, Dict
 from scipy.optimize import minimize
 
-from .utils import md_print
 from .account import Transaction, Account
 from .dataloader import (
     DataPreprocessor, 
-    get_txs_for_ids, 
+    get_txs_for_ids,
     get_balance_for_id,
-    to_account_features
+    to_account_features,
 )
 
 CONSTRAINTS = {
-    'value': [1.0, 1e+18],  # 1 wei to 1 ETH
+    'value': [1.0, 1e21],
     'gas': 21000,
-    'gas_price': [1e+8, 1e+11]  # 1-100 gwei
+    'gas_price': [1e9, 1e12]
 }
 
-class Attack:
+class GNNAttack:
     
     def __init__(
         self,
         model: torch.nn.Module,
         datapreprocessor: DataPreprocessor,
-        evading_id: int
+        evading_id: int,
+        main_initial_balance: float,
+        sybil_initial_balance: float,
+        max_balance_prop: float = 0.8,
+        remove_exit: bool = False,
     ):
+        """Initialize the attack."""
         self.model = model
         self.data = datapreprocessor
         self.controlled_ids = [evading_id]
+        self.main_initial_balance = main_initial_balance
+        self.sybil_initial_balance = sybil_initial_balance
+        self.max_balance_prop = max_balance_prop
+        self.remove_exit = remove_exit
         self.device = next(model.parameters()).device
-        self._setup()
-        # print(f'Initial balance: {self._balance(evading_id):.2e}')
-
-    def _setup(self):
-        id = self.controlled_ids[0]
-        self.graph = deepcopy(self.data.graph).to(self.device)
         
-        self.txs = get_txs_for_ids(self.data.txs, id)
-        self.node_features = self._get_node_features(
-            self.txs, self.controlled_ids)
-
-        initial_balance = get_balance_for_id(self.data.txs, id)
-        initial_balance = initial_balance if initial_balance > 0 else 1e+17
-
-        self.controlled_accounts = {id: Account(
-            id, initial_balance)}
-        self._create_sybil()
-
     def _create_sybil(self):
+        """Create a new Sybil account."""
         sybil_id = self.graph.add_node()
         self.controlled_ids.append(sybil_id)
-        self.controlled_accounts[sybil_id] = Account(sybil_id)
+        self.controlled_accounts[sybil_id] = Account(sybil_id, self.sybil_initial_balance)
         self.node_features = self._get_node_features(self.txs, self.controlled_ids)
     
     def run(
@@ -62,12 +53,12 @@ class Attack:
         num_optim_steps,
         p_evasion_threshold,
         gas_penalty,
-    ):
+    ) -> Dict:
+        """Run the attack."""
         self.num_steps = num_steps
         self.num_optim_steps = num_optim_steps
         self.p_evasion_threshold = p_evasion_threshold
         self.gas_penalty = gas_penalty
-        
         results = {
             'success': False,
             'steps_taken': 0,
@@ -77,49 +68,76 @@ class Attack:
             'probabilities': [],
             'total_gas_cost': 0.0,
             'total_value_transferred': 0.0,
+            'negative_balance': False,
             'sybils_created': len(self.controlled_ids) - 1,
             'early_stopped': False,
         }
         
+        # setup
+        id = self.controlled_ids[0]
+        self.txs = get_txs_for_ids(self.data.txs, id)
+        self.graph = self.data.graph.clone().to(self.device)
+
+        if self.remove_exit:
+            outflow_txs = self.txs.loc[self.txs['from_id'] == id]
+            if len(outflow_txs) > 0:
+                highest_outflow_tx = outflow_txs.sort_values('value', ascending=False).iloc[0]
+                tx_idx = highest_outflow_tx.name
+                affected_nodes = [highest_outflow_tx['from_id'], highest_outflow_tx['to_id']]
+                self.txs = self.txs.drop(index=tx_idx).reset_index(drop=True)
+                self.graph.delete_edge(tx_idx)
+                updated_node_features = self._get_node_features(self.txs, affected_nodes)
+                self.graph.update_node_features(affected_nodes, updated_node_features)
+
+        initial_balance = get_balance_for_id(self.txs, id)
+        if initial_balance < 0:
+            initial_balance = self.main_initial_balance
+            results['negative_balance'] = True
+
+        self.controlled_accounts = {id: Account(id, initial_balance)}
+        self._create_sybil()
+        results['sybils_created'] += 1
+
+        # main loop
         for step in range(num_steps):
             # print(f"\nStep {step + 1}/{num_steps}")
             gradients, probs = self._compute_gradients()
-            # self.display_probs(probs)
             
             if step == 0:
                 results['initial_prob'] = float(probs[0])
             
             results['probabilities'].append({
                 'step': step + 1,
-                'probs': {id: float(p) for id, p in zip(self.controlled_ids, probs)}
+                'probs': {int(id): float(p) for id, p in zip(self.controlled_ids, probs)}
             })
             
             # find highest risk account
             high_risk_idx = probs.argmax()
             high_risk_id = self.controlled_ids[high_risk_idx]
-            
+
             if probs[high_risk_idx] < p_evasion_threshold:
-                # print(f'Success! Early stopping after {step + 1} steps.')
+                # print(f'success! early stopping after {step + 1} steps.')
                 results['success'] = True
                 results['early_stopped'] = True
-                results['steps_taken'] = step + 1
+                results['steps_taken'] = step
                 results['final_prob'] = float(probs[0])
                 self.results = results
                 return results
             
             adv_tx = self._find_optimal_tx(
                 high_risk_id,
-                gradients,
+                gradients,  
                 probs,
             )
 
             if adv_tx is None:
-                # print("Warning: No valid transaction found. Creating a new sybil.")
+                if step == 0: # early stopping: creating new sybils won't help
+                    return results
                 self._create_sybil()
                 results['sybils_created'] += 1
             else:
                 self._apply_tx(adv_tx)
-                results['transactions'].append(adv_tx)
+                results['transactions'].append(adv_tx.to_dict())
                 results['total_gas_cost'] += adv_tx.gas_cost
                 results['total_value_transferred'] += adv_tx.value
                 
@@ -128,10 +146,8 @@ class Attack:
         results['final_prob'] = float(final_probs[0])
         results['steps_taken'] = num_steps
         
-        # check if any account is still above threshold
         max_final_prob = float(final_probs.max())
-        if max_final_prob > p_evasion_threshold:
-            results['success'] = False
+        results['success'] = max_final_prob < p_evasion_threshold
         
         self.results = results
         return results
@@ -153,21 +169,27 @@ class Attack:
         for v_s, v_r in pairs:
             balance = self._balance(v_s)
             
-            # quick feasibility check
-            min_cost = CONSTRAINTS['value'][0] + CONSTRAINTS['gas'] * CONSTRAINTS['gas_price'][0]
+            # gas cost calculation
+            min_total_gas_cost = CONSTRAINTS['gas'] * CONSTRAINTS['gas_price'][0]
+            min_cost = CONSTRAINTS['value'][0] + min_total_gas_cost
+            
             if balance < min_cost:
                 continue
             
-            max_gas_price = min(
+            # gas price limits
+            max_affordable_gas_price = min(
                 CONSTRAINTS['gas_price'][1],
-                balance / CONSTRAINTS['gas']
+                (balance - CONSTRAINTS['value'][0]) / CONSTRAINTS['gas']
             )
+            
+            if max_affordable_gas_price < CONSTRAINTS['gas_price'][0]:
+                continue
             
             def objective(params):
                 value, gas_price = params
                 
                 value = max(CONSTRAINTS['value'][0], min(CONSTRAINTS['value'][1], value))
-                gas_price = max(CONSTRAINTS['gas_price'][0], min(max_gas_price, gas_price))
+                gas_price = max(CONSTRAINTS['gas_price'][0], min(max_affordable_gas_price, gas_price))
                 
                 gas_cost = CONSTRAINTS['gas'] * gas_price
                 total_cost = value + gas_cost
@@ -183,28 +205,31 @@ class Attack:
                     gas=CONSTRAINTS['gas'],
                     gas_price=gas_price
                 )
+                
+                # penalizes solutions with high gas prices to encourage efficient transactions
                 impact = self._compute_tx_impact(tx, gradients, probs)
+                gas_penalty_term = self.gas_penalty * (gas_price / 1e9)  # gas_price in gwei
+                
+                return impact + gas_penalty_term
 
-                return impact
-
-            # reserve 40% for future transactions
-            usable_balance = balance * 0.6
-            max_affordable_value = usable_balance - CONSTRAINTS['gas'] * CONSTRAINTS['gas_price'][0]
+            # reserve (1 - max_balance_prop)% for future transactions
+            usable_balance = balance * self.max_balance_prop
             
-            # ensure we have enough balance for at least minimum transaction
+            max_affordable_value = usable_balance - (CONSTRAINTS['gas'] * CONSTRAINTS['gas_price'][0])
             if max_affordable_value < CONSTRAINTS['value'][0]:
                 continue
                 
             bounds = [
                 (CONSTRAINTS['value'][0], min(CONSTRAINTS['value'][1], max_affordable_value)),
-                (CONSTRAINTS['gas_price'][0], max_gas_price)
+                (CONSTRAINTS['gas_price'][0], max_affordable_gas_price)
             ]
             
-            # multiple starting points to avoid local minima
+            # diverse starting points for better optimization
             starting_points = [
-                [CONSTRAINTS['value'][0], CONSTRAINTS['gas_price'][0]], # Minimal cost
-                [max_affordable_value * 0.1, max_gas_price * 0.1],      # Low cost
-                [max_affordable_value * 0.5, max_gas_price * 0.5],      # Medium cost
+                [CONSTRAINTS['value'][0], CONSTRAINTS['gas_price'][0]],         # minimal cost
+                [max_affordable_value * 0.1, max_affordable_gas_price * 0.1],   # low cost
+                [max_affordable_value * 0.5, max_affordable_gas_price * 0.5],   # medium cost
+                [max_affordable_value * 0.8, CONSTRAINTS['gas_price'][0]],      # high value, low gas
             ]
             
             for start_point in starting_points:
@@ -236,18 +261,17 @@ class Attack:
                 except Exception as e:
                     continue
         
-        # could not find a beneficial solution
+        # a beneficial transaction should have negative impact (reducing probability)
         if best_score > 0:
             return None
         
         # if best_tx:
-        #     print(f"Optimal: {best_tx.from_id} → {best_tx.to_id} (Impact: {best_score:.4f})")
+        #     print(f"optimal: {best_tx.from_id} → {best_tx.to_id} (impact: {best_score:.4f})")
         
         return best_tx
     
     def _compute_tx_impact(self, tx, gradients, probs) -> float:
-        # gradient_norms = torch.norm(gradients, dim=1)
-        # gradient_weights = gradient_norms / (gradient_norms.sum() + 1e-8)
+        """Compute the impact of a transaction on predictions."""
         delta_tensor = self._get_delta_features(tx)
         logit_changes = (delta_tensor * gradients).sum(dim=1)
         prob_weights = probs / (probs.sum() + 1e-8)        
@@ -265,7 +289,9 @@ class Attack:
         self.txs = pd.concat([self.txs, tx.to_df()])
         self.node_features = self._get_node_features(self.txs, self.controlled_ids)
         self.graph.update_node_features(self.controlled_ids, self.node_features)
-        self.graph.add_edge(tx.from_id, tx.to_id, tx.to_edge_features())
+        edge_features = tx.to_edge_features(device=self.device)
+        self.graph.add_edge(tx.from_id, tx.to_id, edge_features)
+        
         self.controlled_accounts[tx.from_id].send(tx)
         self.controlled_accounts[tx.to_id].receive(tx)
         
@@ -291,16 +317,4 @@ class Attack:
     def _balance(self, id: int) -> float:
         """Get the balance of a controlled account."""
         return self.controlled_accounts[id].balance
-
-    def display_tensor(self, tensor: torch.Tensor):
-        tensor_df = pd.DataFrame(
-            tensor.cpu().numpy(),
-            columns=self.data.feature_names,
-            index=self.controlled_ids)
-        md_print(tensor_df, index=True)
-        
-    def display_probs(self, probs: list):
-        probs_df = pd.DataFrame(
-            probs.tolist(), columns=['Probability'], index=self.controlled_ids
-        )
-        md_print(probs_df, index=True)
+    

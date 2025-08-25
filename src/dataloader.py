@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import pandas as pd
 
+from loguru import logger
 from typing import Optional, Union
 from torch_geometric.data import Data
 from sklearn.preprocessing import StandardScaler
@@ -9,13 +10,20 @@ from sklearn.preprocessing import StandardScaler
 from .graph import Graph
 
 
-def load_txs(dataset_name: str, filter: bool = True) -> pd.DataFrame:
-    """Load transactions from a specified dataset.
-    """
-    if not dataset_name in ['ammari', 'etfd', 'agg']:
-        raise ValueError("Dataset name must be either 'ammari' or 'etfd' or 'agg'.")
+def load_txs(dataset_name: str) -> pd.DataFrame:
+    """Load transactions from a specified dataset."""
+    if dataset_name == 'etfd':
+        return load_etfd()
+    elif dataset_name == 'augmented':
+        return load_augmented()
+    elif dataset_name == 'filtered':
+        return load_filtered()
+    else:
+        raise ValueError("Unknown dataset name.")
 
-    txs = pd.read_csv(f'data/{dataset_name}/dataset.csv')
+def load_etfd() -> pd.DataFrame:
+    """Load the etfd dataset."""
+    txs = pd.read_csv('data/etfd/dataset.csv')
     txs_df = txs[['from_address', 'to_address', 'value', 'gas', 'gas_price', 'input', 'receipt_gas_used', 'from_scam', 'to_scam', 'from_category', 'to_category']].copy()
     txs_df = txs_df.dropna(subset=['to_address'])
 
@@ -30,15 +38,61 @@ def load_txs(dataset_name: str, filter: bool = True) -> pd.DataFrame:
         
     return txs_df
 
+def load_augmented() -> pd.DataFrame:
+    """Load the augmented dataset."""
+    aug = pd.read_parquet('data/augmented2025/dataset.parquet')
+    txs_df = aug[['from_address', 'to_address', 'value', 'gas', 'gas_price', 'receipt_gas_used', 'from_scam', 'to_scam', 'from_category', 'to_category']].copy()
+    txs_df = txs_df.dropna(subset=['to_address'])
+    txs_df['input'] = '0x' + txs_df['gas'].apply(lambda x: hex(x) if x >= 30000 else '')
+
+    for col in ['value', 'gas', 'gas_price', 'receipt_gas_used']:
+        txs_df[col] = pd.to_numeric(txs_df[col], errors='coerce')
+    
+    unique_addresses = pd.concat([txs_df['from_address'], txs_df['to_address']]).unique()
+    address_to_id = {addr: idx for idx, addr in enumerate(unique_addresses)}
+    txs_df['from_id'] = txs_df['from_address'].map(address_to_id)
+    txs_df['to_id'] = txs_df['to_address'].map(address_to_id)
+    txs_df['scam'] = txs_df['from_scam'] | txs_df['to_scam']
+        
+    return txs_df
+
+def load_filtered() -> pd.DataFrame:
+    """Load the filtered dataset."""
+    txs = pd.read_parquet('data/filtered/dataset.parquet', engine='fastparquet')
+    txs_df = txs[['from_address', 'to_address', 'value', 'gas', 'gas_price', 'input', 'receipt_gas_used', 'from_scam', 'to_scam', 'from_category', 'to_category']].copy()
+    unique_addresses = pd.concat([txs_df['from_address'], txs_df['to_address']]).unique()
+    address_to_id = {addr: idx for idx, addr in enumerate(unique_addresses)}
+    txs_df['from_id'] = txs_df['from_address'].map(address_to_id)
+    txs_df['to_id'] = txs_df['to_address'].map(address_to_id)
+    txs_df['scam'] = txs_df['from_scam'] | txs_df['to_scam']
+        
+    return txs_df
+
 def get_txs_for_ids(txs: pd.DataFrame, ids: Union[int, list]) -> pd.DataFrame:
     """Filter transactions for specific node IDs.
+    
+    Args:
+        txs: Transaction DataFrame
+        ids: Node ID(s) to filter for
+        
+    Returns:
+        Filtered DataFrame containing transactions involving the specified nodes
     """
-    ids = [ids] if isinstance(ids, int) else ids
-    txs_ids = txs[(txs['from_id'].isin(ids)) | (txs['to_id'].isin(ids))]
+    import numpy as np
+    ids = [ids] if isinstance(ids, (int, np.integer)) else ids
+    txs_ids = txs[(txs['from_id'].isin(ids)) | (txs['to_id'].isin(ids))].copy()
     return txs_ids.reset_index(drop=True)
 
-def get_balance_for_id(txs, node_id: int) -> float:
-    """Get account balance from transaction history."""
+def get_balance_for_id(txs: pd.DataFrame, node_id: int) -> float:
+    """Calculate account balance from transaction history.
+    
+    Args:
+        txs: Transaction DataFrame
+        node_id: Account ID to calculate balance for
+        
+    Returns:
+        Net balance (inflow - outflow) for the account
+    """
     is_sender = txs['from_id'] == node_id
     is_receiver = txs['to_id'] == node_id
     
@@ -50,8 +104,14 @@ def get_balance_for_id(txs, node_id: int) -> float:
     
     return float(inflow - outflow)
 
-def get_scam_status_and_category(txs):
-    """Extracts scam status and category for each node from transaction data.
+def get_scam_status_and_category(txs: pd.DataFrame) -> pd.DataFrame:
+    """Extract scam status and category for each node from transaction data.
+    
+    Args:
+        txs: Transaction DataFrame with scam information
+        
+    Returns:
+        DataFrame with node_id, scam status, and scam_category columns
     """
     from_info = txs[['from_id', 'from_scam', 'from_category']].rename(
         columns={'from_id': 'node_id', 'from_scam': 'scam', 'from_category': 'scam_category'}
@@ -66,8 +126,7 @@ def get_scam_status_and_category(txs):
     return all_info
     
 def to_account_features(txs: pd.DataFrame, use_address: bool = False, scam_features: bool = False, edge_features: bool = False) -> tuple:
-    """Engineers node features from a transaction DataFrame.
-    """
+    """Engineers node features from a transaction DataFrame."""
     df = txs.copy()
     
     # --- preprocessing ---
@@ -134,8 +193,16 @@ def to_account_features(txs: pd.DataFrame, use_address: bool = False, scam_featu
 
         return nodes_df, edges, edge_features
 
-def filter_inactive_accounts(node_features, edges, edge_features):
+def filter_inactive_accounts(node_features: pd.DataFrame, edges: pd.DataFrame, edge_features: pd.DataFrame) -> tuple:
     """Filter out inactive accounts based on transaction counts.
+    
+    Args:
+        node_features: DataFrame with node features
+        edges: DataFrame with edge connections
+        edge_features: DataFrame with edge features
+        
+    Returns:
+        Tuple of filtered (node_features, edges, edge_features)
     """
     node_features = node_features[(node_features['n_tx_total'] > 1) & (node_features['in_value_count'] > 0)]
 
@@ -147,8 +214,16 @@ def filter_inactive_accounts(node_features, edges, edge_features):
     
     return node_features, edges, edge_features
 
-def remap_ids(txs, node_features, edges):
+def remap_ids(txs: pd.DataFrame, node_features: pd.DataFrame, edges: pd.DataFrame) -> tuple:
     """Remap node and edge IDs to a continuous range starting from 0.
+    
+    Args:
+        txs: Transaction DataFrame
+        node_features: DataFrame with node features
+        edges: DataFrame with edge connections
+        
+    Returns:
+        Tuple of (txs, node_features, edges) with remapped IDs
     """
     id_map = {old: new for new, old in enumerate(node_features['node_id'])}
     
@@ -172,23 +247,31 @@ def remap_ids(txs, node_features, edges):
     
     return txs, node_features, edges
 
-def filter_and_remap(txs, node_features, edges, edge_features):
-    """Filter inactive accounts and remap ids.
+def filter_and_remap(txs: pd.DataFrame, node_features: pd.DataFrame, edges: pd.DataFrame, edge_features: pd.DataFrame) -> tuple:
+    """Filter inactive accounts and remap IDs to continuous range.
+    
+    Args:
+        txs: Transaction DataFrame
+        node_features: DataFrame with node features
+        edges: DataFrame with edge connections
+        edge_features: DataFrame with edge features
+        
+    Returns:
+        Tuple of (txs, node_features, edges, edge_features) filtered and remapped
     """
     node_features, edges, edge_features = filter_inactive_accounts(node_features, edges, edge_features)
     txs, node_features, edges = remap_ids(txs, node_features, edges)
 
     return txs, node_features, edges, edge_features
 
-def to_graph(
+def to_pyg_data(
     node_features: np.ndarray,
     node_labels: np.ndarray,
     edges: np.ndarray,
     edge_features: Optional[np.ndarray] = None,
     device: Optional[torch.device] = None
 ) -> Data:
-    """Convert node and edge features into a PyTorch Geometric Data object with device support.
-    """
+    """Convert node and edge features into a PyTorch Geometric Data object."""
     if device is None:
         device = torch.device('cpu')
     
@@ -200,21 +283,21 @@ def to_graph(
     if edge_features is not None:
         edge_attr = torch.tensor(edge_features, dtype=torch.float, device=device)
 
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
 
-    return Graph(data, requires_grad=True)
 
 class DataPreprocessor:
-    """Loads and preprocesses transaction data for graph neural networks."""
+    """Preprocesses transaction data for machine learning models and attack simulations."""
     
-    def __init__(self, dataset_name):
-        self.txs = load_txs(dataset_name, False)
+    def __init__(self, txs: pd.DataFrame) -> None:
+        """Initialize data preprocessor from transaction DataFrame.
+        
+        Args:
+            txs: DataFrame containing transaction data
+        """
+        self.txs = txs
         self.node_features, self.edges, self.edge_features = to_account_features(self.txs, True, True, True)
-        
-        # self.txs, self.node_features, self.edges, self.edge_features = filter_and_remap(
-        #     txs, node_features, edges, edge_features
-        # )
-        
+
         self.node_labels = self.node_features['scam'].astype(int)
         self.feature_names = [col for col in self.node_features.columns 
                              if col not in ['node_id', 'scam', 'address', 'scam_category']]
@@ -225,35 +308,65 @@ class DataPreprocessor:
         scaled_nodes = self.node_scaler.fit_transform(self.node_features[self.feature_names].values)
         scaled_edges = self.edge_scaler.fit_transform(self.edge_features.values)
         
-        self.graph = to_graph(
-            scaled_nodes,
+        pyg = to_pyg_data(
+            scaled_nodes, 
             self.node_labels.values, 
             self.edges.values, 
             scaled_edges,
             device=torch.device('cpu')
         )
-        print(f"Dataset preprocessing completed: {len(self.node_labels)} nodes, {len(self.edge_features)} edges")
+        self.graph = Graph(pyg, requires_grad=True)
+
+        logger.info(f"Dataset preprocessing completed: {len(self.node_labels)} nodes, {len(self.edge_features)} edges")
+
+    def normalize_node_features(self, features: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        """Normalize node features using the fitted scaler.
         
-    def normalize_node_features(self, features: np.ndarray | pd.DataFrame) -> np.ndarray:
-        """Normalize node features using the fitted scaler."""
+        Args:
+            features: Node features to normalize
+            
+        Returns:
+            Normalized feature array
+        """
         if isinstance(features, pd.DataFrame):
             features = features[self.feature_names].values
         return self.node_scaler.transform(features)
 
-    def normalize_edge_features(self, features: np.ndarray | pd.DataFrame) -> np.ndarray:
-        """Normalize edge features using the fitted scaler."""
+    def normalize_edge_features(self, features: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        """Normalize edge features using the fitted scaler.
+        
+        Args:
+            features: Edge features to normalize
+            
+        Returns:
+            Normalized feature array
+        """
         if isinstance(features, pd.DataFrame):
             features = features.values
         return self.edge_scaler.transform(features)
 
-    def unnormalize_node_features(self, features: np.ndarray | pd.DataFrame) -> np.ndarray:
-        """Unnormalize node features using the fitted scaler."""
+    def unnormalize_node_features(self, features: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        """Reverse normalization of node features using the fitted scaler.
+        
+        Args:
+            features: Normalized node features to reverse
+            
+        Returns:
+            Original scale feature array
+        """
         if isinstance(features, pd.DataFrame):
             features = features[self.feature_names].values
         return self.node_scaler.inverse_transform(features)
 
-    def unnormalize_edge_features(self, features: np.ndarray | pd.DataFrame) -> np.ndarray:
-        """Unnormalize edge features using the fitted scaler."""
+    def unnormalize_edge_features(self, features: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        """Reverse normalization of edge features using the fitted scaler.
+        
+        Args:
+            features: Normalized edge features to reverse
+            
+        Returns:
+            Original scale feature array
+        """
         if isinstance(features, pd.DataFrame):
             features = features.values
         return self.edge_scaler.inverse_transform(features)

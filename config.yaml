@@ -1,20 +1,48 @@
-# training
-dropout: 0.2
+# Graph models
+
+# learning
 num_classes: 2
-hidden_units: 128
-
-lr: 0.009
-epochs: 1000
-weight_decay: 0.0005
-early_stopping_patience: 100
-
+lr: 0.005
+epochs: 250
+dropout: 0.1
+weight_decay: 0.0001
+early_stopping_patience: 30
+device: 'auto'
 seed: 42
-num_folds: 4
-device: "auto"
+
+# architecture
+layers: 2
+hidden_units: 256
+use_batch_norm: true
 
 # model-specific
-gat_heads: 1
+
+# GAT
+gat_heads: 4
 gat_dropout: 0.2
-gatv2_heads: 1
+
+# GATv2
+gatv2_heads: 4
 gatv2_dropout: 0.2
-cheb_k: [1, 2]
+
+# Chebyshev
+cheb_k: [2, 3]
+
+# Tabular models
+
+# RealMLP
+realmlp_lr: 0.001
+realmlp_layers: 4
+realmlp_hidden: 512
+realmlp_dropout: 0.25
+realmlp_batch_size: 256
+realmlp_weight_decay: 0.00001
+
+# TabM
+tabm_blocks: 3
+tabm_d_block: 384
+tabm_k: 16
+tabm_dropout: 0.12
+tabm_lr: 0.002
+tabm_batch_size: 256
+tabm_weight_decay: 0.0001
