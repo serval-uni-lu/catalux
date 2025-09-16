@@ -1,5 +1,3 @@
-# Graph models
-
 # learning
 num_classes: 2
 lr: 0.005
@@ -19,30 +17,27 @@ use_batch_norm: true
 
 # GAT
 gat_heads: 4
-gat_dropout: 0.2
+gat_dropout: 0.1
 
 # GATv2
 gatv2_heads: 4
-gatv2_dropout: 0.2
+gatv2_dropout: 0.1
 
 # Chebyshev
 cheb_k: [2, 3]
 
-# Tabular models
+# splits
+val_size: 0.1
+test_size: 0.2
 
-# RealMLP
-realmlp_lr: 0.001
-realmlp_layers: 4
-realmlp_hidden: 512
-realmlp_dropout: 0.25
-realmlp_batch_size: 256
-realmlp_weight_decay: 0.00001
-
-# TabM
-tabm_blocks: 3
-tabm_d_block: 384
-tabm_k: 16
-tabm_dropout: 0.12
-tabm_lr: 0.002
-tabm_batch_size: 256
-tabm_weight_decay: 0.0001
+# attack
+p_evasion_threshold: 0.5
+max_sybils: 5
+max_transformations: 10
+max_budget_prop: 0.4
+gas_penalty_coef: 0.1
+value_penalty_coef: 0.01
+num_optim_steps: 100
+maxiter: 100
+vol_tol: 1e-10
+len_tol: 1e-6

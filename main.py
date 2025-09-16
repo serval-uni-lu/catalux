@@ -1,437 +1,406 @@
-import sys
+import json
 import torch
 import argparse
 import numpy as np
-from loguru import logger
-from typing import Dict, List, Optional, Any, Union
+import pandas as pd
+from pathlib import Path
+from typing import List, Optional
 
 from src.config import Config
-from src.utils import seed_everything
+from src.dataloader import load_txs, DataPreprocessor, get_balance_for_id
+from src.train import GNNTrainer
+from src.models import load_model
+from src.predict import predict_for_ids, evaluate_model, evaluate_all_models
+from src.attack import MultiTargetConstrainedGraphAttack, AttackConfig
 
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="torch_geometric")
 
-
-class FraudDetectionSystem:
-    """Main interface for fraud detection operations."""
+def train(models: List[str], dataset: str = 'mtcga', config_path: Optional[str] = 'config.yaml'):
+    config = Config.from_yaml(config_path) if config_path else Config()
     
-    def __init__(self, config_path: str = "config.yaml"):
-        """Initialize the fraud detection system.
-        
-        Args:
-            config_path: Path to configuration file
-        """
-        self.config = Config.from_yaml(config_path)
-        seed_everything(self.config.seed)
-        self.device = self.config.get_device()
-        logger.info(f"Initialized system with device: {self.device}")
-        
-    def train(
-        self,
-        models: List[str],
-        dataset: str = "etfd",
-        model_type: str = "both",
-        val_size: float = 0.1,
-        test_size: float = 0.2,
-        save_models: bool = True
-    ) -> Dict[str, Any]:
-        """Train fraud detection models.
-        
-        Args:
-            models: List of model names to train (e.g., ['GCN', 'GAT', 'RealMLP'])
-            dataset: Dataset name ('etfd', 'augmented', 'filtered')
-            model_type: Type of models ('gnn', 'tabular', 'both')
-            val_size: Validation split size
-            test_size: Test split size
-            save_models: Whether to save trained models
-            
-        Returns:
-            Dictionary containing training results for each model
-        """
-        from src.train_all import train_all_models
-        
-        logger.info(f"Training {len(models)} models on {dataset} dataset")
-        
-        results = train_all_models(
-            models=models,
-            dataset=dataset,
-            model_type=model_type,
-            config=self.config,
-            val_size=val_size,
-            test_size=test_size,
-            save_models=save_models
-        )
-        
-        if results:
-            best_model = max(results.items(), key=lambda x: x[1].get('test_metrics', {}).get('f1', 0))
-            logger.info(f"Best model: {best_model[0]} with F1: {best_model[1]['test_metrics']['f1']:.4f}")
-        
-        return results
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.seed)
     
-    def evaluate(
-        self,
-        model_names: Union[str, List[str]],
-        dataset: str = "etfd",
-        test_size: float = 0.2,
-        models_dir: str = "models",
-        save_results: Optional[str] = None
-    ) -> Dict[str, Dict[str, float]]:
-        """Evaluate trained models.
+    print(f"Loading dataset: {dataset}")
+    txs = load_txs(dataset)
+    data = DataPreprocessor(txs)
+    
+    trainer = GNNTrainer(config)
+    
+    available_models = ['GCN', 'GAT', 'GATv2', 'SAGE', 'Chebyshev']
+    if 'all' in models:
+        models = available_models
+    
+    for model_name in models:
+        if model_name not in available_models:
+            print(f"Model {model_name} not available. Available: {available_models}")
+            continue
         
-        Args:
-            model_names: Model name(s) to evaluate
-            dataset: Dataset name
-            test_size: Test split size
-            models_dir: Directory containing model files
-            save_results: Optional path to save results CSV
-            
-        Returns:
-            Dictionary containing evaluation metrics for each model
-        """
-        from src.evaluate import evaluate_model_by_name, save_evaluation_results
-        
-        if isinstance(model_names, str):
-            model_names = [model_names]
-        
-        logger.info(f"Evaluating {len(model_names)} models on {dataset} dataset")
-        
-        all_results = {}
-        for model_name in model_names:
-            logger.info(f"Evaluating {model_name}...")
+        print(f"\nTraining {model_name}...")
+        try:
+            trainer.train_model(model_name, data.graph)
+            print(f"Training completed for {model_name}")
+        except Exception as e:
+            print(f"Error training {model_name}: {e}")
+
+def evaluate(models: Optional[List[str]] = None, dataset: str = 'mtcga', 
+            split: str = 'test', config_path: Optional[str] = 'config.yaml'):
+    config = Config.from_yaml(config_path) if config_path else Config()
+    
+    print(f"Loading dataset: {dataset}")
+    txs = load_txs(dataset)
+    data = DataPreprocessor(txs)
+    
+    if models is None:
+        results = evaluate_all_models(data.graph, config, split)
+    else:
+        results = {}
+        for model_name in models:
             try:
-                metrics = evaluate_model_by_name(
-                    model_name=model_name,
-                    dataset=dataset,
-                    config=self.config,
-                    test_size=test_size,
-                    models_dir=models_dir
-                )
-                all_results[model_name] = metrics
-                logger.info(f"{model_name} - F1: {metrics['f1']:.4f}, AUC: {metrics['auc']:.4f}")
+                metrics = evaluate_model(model_name, data.graph, config, split)
+                results[model_name] = metrics
+                print(f"{model_name} - {split} F1: {metrics['f1']:.4f}, AUC: {metrics['auc']:.4f}")
             except Exception as e:
-                logger.error(f"Error evaluating {model_name}: {e}")
-                all_results[model_name] = {'error': str(e)}
-        
-        if save_results:
-            save_evaluation_results(all_results, save_results)
-            logger.info(f"Results saved to {save_results}")
-        
-        return all_results
+                print(f"Error evaluating {model_name}: {e}")
+                results[model_name] = {'error': str(e)}
     
-    def attack(
-        self,
-        model: Union[str, torch.nn.Module],
-        dataset: str = "etfd",
-        target_node: int = None,
-        save_results: Optional[str] = None,
-        **attack_params
-    ) -> Dict[str, Any]:
-        """Run adversarial attack on a model.
+    print("\n" + "="*50)
+    print("Summary:")
+    for model_name, metrics in results.items():
+        if 'error' not in metrics:
+            print(f"{model_name:10} - F1: {metrics['f1']:.4f}, AUC: {metrics['auc']:.4f}, "
+                  f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}")
+    
+    return results
+
+def attack(
+        models: Optional[List[str]] = None, dataset: str = 'mtcga',
+        split: str = 'test', config_path: Optional[str] = 'config.yaml',
+        limit: Optional[int] = None):
+    """Attack all detected scam accounts in the specified dataset and split.
+
+    Args:
+        models: List of model names to attack (None for all)
+        dataset: Dataset name
+        split: Data split to attack ('train', 'val', or 'test')
+        config_path: Path to config file
+        limit: Optional limit on number of nodes to attack per model
+    """
+    
+    config = Config.from_yaml(config_path) if config_path else Config()
+    
+    print(f"Loading dataset: {dataset}")
+    txs = load_txs(dataset)
+    data = DataPreprocessor(txs)
+
+    # load attack configuration
+    attack_config = AttackConfig()
+
+    # create results directory
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    
+    # get available models
+    available_models = ['GCN', 'GAT', 'GATv2', 'SAGE', 'Chebyshev']
+    if models is None or 'all' in models:
+        models = available_models
+    
+    # load split indices
+    for model_name in models:
+        if model_name not in available_models:
+            print(f"Model {model_name} not available. Available: {available_models}")
+            continue
         
-        Args:
-            model: Model name or loaded model object
-            dataset: Dataset name
-            target_node: Target node ID for attack
-            save_results: Optional path to save attack results JSON
-            **attack_params: Additional attack parameters including:
-                - evading_ids: List of target node IDs
-                - main_initial_balance: Initial balance for main account
-                - sybil_initial_balance: Initial balance for sybil accounts
-                - max_balance_prop: Maximum proportion of balance to use
-                - remove_exit: Whether to remove exit transactions
-                - p_detection_threshold: Detection probability threshold
-                - p_evasion_threshold: Evasion probability threshold
-                - num_accounts: Number of accounts to attack if evading_ids not specified
-                - num_steps: Number of attack steps
-                - num_optim_steps: Number of optimization steps per attack step
-                - gas_penalty: Gas penalty factor
+        print(f"\n{'='*60}")
+        print(f"Attacking {model_name} on {split} split")
+        print('='*60)
+        
+        # load model and split
+        model_dir = Path(f"models/{model_name}")
+        if not model_dir.exists():
+            print(f"Model {model_name} not found in models directory")
+            continue
+        
+        split_file = model_dir / f"{split}.npy"
+        if not split_file.exists():
+            print(f"Split file {split_file} not found")
+            continue
+        
+        try:
+            # load model
+            edge_dim = data.graph.edge_attr.shape[1] if data.graph.edge_attr is not None else 0
+            model = load_model(model_name, data.graph.x.shape[1], edge_dim, config)
+            device = config.get_device()
+            model = model.to(device)
+        except Exception as e:
+            print(f"Error loading model {model_name}: {e}")
+            continue
+        
+        try:
+            # get split indices
+            split_indices = np.load(split_file)
             
-        Returns:
-            Dictionary containing attack results
-        """
-        from src.attack_interface import run_attack
+            # get predictions for all nodes in split
+            probs = predict_for_ids(model, data.graph, split_indices)
+        except Exception as e:
+            print(f"Error getting predictions for {model_name}: {e}")
+            continue
         
-        # log attack config
-        if 'evading_ids' in attack_params and attack_params['evading_ids']:
-            logger.info(f"Running attack on {len(attack_params['evading_ids'])} specified targets")
-        elif target_node:
-            logger.info(f"Running attack on target node {target_node}")
+        # get scam nodes
+        scam_mask = probs >= 0.5
+        scam_indices = split_indices[scam_mask]
+        scam_probs = probs[scam_mask]
+        
+        if len(scam_indices) == 0:
+            print(f"No scam accounts detected by {model_name} in {split} split")
+            results = {
+                'model': model_name,
+                'split': split,
+                'total_nodes': len(split_indices),
+                'detected_scam_nodes': 0,
+                'attacks': []
+            }
         else:
-            logger.info(f"Running attack - will auto-detect targets with probability > {attack_params.get('p_detection_threshold', 0.5)}")
-        
-        # run the attack with all parameters
-        results = run_attack(
-            model=model,
-            dataset=dataset,
-            target_node=target_node,
-            config=self.config,
-            save_results=save_results,
-            **attack_params
-        )
-        
-        # log results summary
-        if isinstance(results, dict):
-            if 'individual_results' in results:
-                # multiple targets
-                success_rate = results.get('success_rate', 0.0)
-                total = results.get('total_targets', 0)
-                successful = results.get('successful_attacks', 0)
-                logger.info(f"Attack completed: {successful}/{total} successful (success rate: {success_rate:.2%})")
-            elif results.get('success'):
-                # single target
-                logger.info(f"Attack successful - Steps: {results.get('steps_taken', 'N/A')}, "
-                           f"Final prob: {results.get('final_prob', 'N/A')}")
+            print(f"Found {len(scam_indices)} scam accounts to attack")
+            
+            attack_results = []
+            successful_attacks = 0
+            
+            # attack each detected scam node
+            attack_limit = limit if limit is not None else len(scam_indices)
+            attacked_nodes = 0
+            for idx, node_id in enumerate(scam_indices):
+                if attacked_nodes >= attack_limit:
+                    break
+                    
+                print(f"\nChecking node {node_id} ({idx+1}/{len(scam_indices)})")
+                
+                # check if node has positive balance
+                node_balance = get_balance_for_id(txs, int(node_id))
+                if node_balance <= 0:
+                    print(f"  Skipping node {node_id} - zero or negative balance ({node_balance/1e18:.6f} ETH)")
+                    continue
+                
+                print(f"  Node balance: {node_balance/1e18:.6f} ETH - proceeding with attack")
+                attacked_nodes += 1
+                
+                try:
+                    # run attack
+                    attacker = MultiTargetConstrainedGraphAttack(
+                        evading_ids=int(node_id),
+                        model=model,
+                        datapreprocessor=data,
+                        config=attack_config
+                    )
+                    
+                    result = attacker.run()
+                    
+                    # store result
+                    attack_result = {
+                        'node_id': int(node_id),
+                        'success': bool(result.success),
+                        'initial_prob': float(result.initial_prob),
+                        'final_prob': float(result.final_prob),
+                        'steps_taken': int(result.steps_taken),
+                        'sybils_created': int(result.sybils_created),
+                        'budget_spent': float(result.budget_spent),
+                        'budget_spent_prop': float(result.budget_spent_prop),
+                        'total_budget': float(result.total_budget),
+                        'budget_exhausted': bool(result.budget_exhausted),
+                        'early_stopped': bool(result.early_stopped),
+                        'num_transactions': len(result.transactions),
+                        'transactions': [dict(tx) for tx in result.transactions],
+                        'probabilities': [
+                            {
+                                'step': int(prob['step']),
+                                'probs': {str(k): float(v) for k, v in prob['probs'].items()}
+                            } for prob in result.probabilities
+                        ]
+                    }
+                    
+                    initial_prob = float(result.initial_prob)
+                    if result.success:
+                        successful_attacks += 1
+                        print(f"    Attack successful! P(fraud): {initial_prob:.3f} → {result.final_prob:.3f}")
+                        print(f"    Budget: {result.budget_spent/1e18:.3f}/{result.total_budget/1e18:.3f} ETH ({result.budget_spent_prop:.1%})")
+                        print(f"    Sybils: {result.sybils_created}, Steps: {result.steps_taken}")
+                        if result.steps_taken == 0:
+                            print(f"    Method: No transformations needed (already below threshold)")
+                    else:
+                        print(f"    Attack failed. P(fraud): {initial_prob:.3f} → {result.final_prob:.3f}")
+                        if result.budget_exhausted:
+                            print(f"    Reason: Budget exhausted ({result.budget_spent:.0f}/{result.total_budget:.0f})")
+                        else:
+                            print(f"    Reason: No beneficial transformations found")
+                    
+                    attack_results.append(attack_result)
+                    
+                except Exception as e:
+                    print(f"  Error attacking node {node_id}: {e}")
+                    attack_results.append({
+                        'node_id': int(node_id),
+                        'error': str(e),
+                        'success': bool(False)
+                    })
+            
+            # compute additional statistics first
+            if attack_results:
+                successful_results = [r for r in attack_results if r.get('success', False)]
+                avg_budget_used = float(np.mean([r['budget_spent_prop'] for r in successful_results])) if successful_results else 0.0
+                avg_sybils = float(np.mean([r['sybils_created'] for r in successful_results])) if successful_results else 0.0
+                avg_steps = float(np.mean([r['steps_taken'] for r in successful_results])) if successful_results else 0.0
             else:
-                logger.info("Attack failed to achieve target")
-        
-        
-        return results
-    
-    def predict(
-        self,
-        model_name: str,
-        node_ids: Union[int, List[int]],
-        dataset: str = "etfd",
-        models_dir: str = "models"
-    ) -> np.ndarray:
-        """Get predictions for specific nodes.
-        
-        Args:
-            model_name: Name of the model
-            node_ids: Node IDs to predict
-            dataset: Dataset name
-            models_dir: Directory containing model files
-            
-        Returns:
-            Array of fraud probabilities
-        """
-        from src.predict import predict_nodes_by_name
-        
-        if isinstance(node_ids, int):
-            node_ids = [node_ids]
-        
-        logger.info(f"Predicting {len(node_ids)} nodes using {model_name}")
-        
-        predictions = predict_nodes_by_name(
-            model_name=model_name,
-            node_ids=node_ids,
-            dataset=dataset,
-            config=self.config,
-            models_dir=models_dir
-        )
-        
-        return predictions
-    
-    def analyze_dataset(self, dataset: str = "etfd") -> Dict[str, Any]:
-        """Analyze dataset statistics.
-        
-        Args:
-            dataset: Dataset name
-            
-        Returns:
-            Dictionary containing dataset statistics
-        """
-        from src.dataloader import load_txs, to_account_features
-        
-        logger.info(f"Analyzing {dataset} dataset")
-        
-        txs = load_txs(dataset)
-        node_features, edges, edge_features = to_account_features(
-            txs=txs, use_address=True, scam_features=True, edge_features=True
-        )
-        
-        stats = {
-            'num_transactions': len(txs),
-            'num_nodes': len(node_features),
-            'num_edges': len(edges),
-            'fraud_rate': node_features['scam'].mean(),
-            'avg_degree': len(edges) * 2 / len(node_features),
-            'feature_dims': len([col for col in node_features.columns 
-                               if col not in ['node_id', 'scam', 'address', 'scam_category']])
-        }
-        
-        logger.info(f"Dataset stats: {stats['num_nodes']} nodes, "
-                   f"{stats['num_edges']} edges, "
-                   f"{stats['fraud_rate']:.2%} fraud rate")
-        
-        return stats
+                avg_budget_used = avg_sybils = avg_steps = 0.0
 
-
-def main():
-    """Main CLI interface."""
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # train command
-    train_parser = subparsers.add_parser('train', help='Train scam detection models')
-    train_parser.add_argument('--models', nargs='+', required=True,
-                            help='Models to train (e.g., GCN GAT RealMLP)')
-    train_parser.add_argument('--dataset', default='etfd',
-                            help='Dataset name (etfd/augmented/filtered)')
-    train_parser.add_argument('--type', choices=['gnn', 'tabular', 'both'], default='both',
-                            help='Model type to train')
-    train_parser.add_argument('--val-size', type=float, default=0.1,
-                            help='Validation split size')
-    train_parser.add_argument('--test-size', type=float, default=0.2,
-                            help='Test split size')
-    train_parser.add_argument('--config', default='config.yaml',
-                            help='Config file path')
-    
-    # evaluate command
-    eval_parser = subparsers.add_parser('evaluate', help='Evaluate trained models')
-    eval_parser.add_argument('--models', nargs='+', required=True,
-                           help='Model names to evaluate (e.g., GCN GAT RealMLP)')
-    eval_parser.add_argument('--dataset', default='etfd',
-                           help='Dataset name')
-    eval_parser.add_argument('--test-size', type=float, default=0.2,
-                           help='Test split size')
-    eval_parser.add_argument('--models-dir', default='models',
-                           help='Directory containing model files')
-    eval_parser.add_argument('--save-results', type=str,
-                           help='Path to save results CSV (e.g., results/performance_metrics.csv)')
-    eval_parser.add_argument('--config', default='config.yaml',
-                           help='Config file path')
-    
-    # attack command
-    attack_parser = subparsers.add_parser('attack', help='Run adversarial attack')
-    attack_parser.add_argument('--model', 
-                             help='Single model name or path (deprecated, use --model)')
-    attack_parser.add_argument('--dataset', default='etfd',
-                             help='Dataset name')
-    attack_parser.add_argument('--evading-ids', nargs='+', type=int,
-                             help='Target node IDs to attack')
-    attack_parser.add_argument('--target-node', type=int,
-                             help='Single target node ID (deprecated, use --evading-ids)')
-    attack_parser.add_argument('--main-initial-balance', type=float, default=1e17,
-                             help='Initial balance for main account (default: 1e17)')
-    attack_parser.add_argument('--sybil-initial-balance', type=float, default=1e17,
-                             help='Initial balance for sybil accounts (default: 1e17)')
-    attack_parser.add_argument('--max-balance-prop', type=float, default=0.8,
-                             help='Maximum proportion of balance to use (default: 0.8)')
-    attack_parser.add_argument('--remove-exit', action='store_true', default=True,
-                             help='Remove exit transactions (default: True)')
-    attack_parser.add_argument('--no-remove-exit', dest='remove_exit', action='store_false',
-                             help='Do not remove exit transactions')
-    attack_parser.add_argument('--p-detection-threshold', type=float, default=0.5,
-                             help='Detection probability threshold (default: 0.5)')
-    attack_parser.add_argument('--num-accounts', type=int,
-                             help='Number of accounts to attack if evading-ids not specified')
-    attack_parser.add_argument('--num-steps', type=int, default=5,
-                             help='Number of attack steps (default: 5)')
-    attack_parser.add_argument('--num-optim-steps', type=int, default=10,
-                             help='Number of optimization steps per attack step (default: 10)')
-    attack_parser.add_argument('--p-evasion-threshold', type=float, default=0.5,
-                             help='Evasion probability threshold (default: 0.5)')
-    attack_parser.add_argument('--gas-penalty', type=float, default=0.0,
-                             help='Gas penalty factor (default: 0.0)')
-    attack_parser.add_argument('--save-results', type=str,
-                             help='Path to save attack results JSON (e.g., results/GAT_attack.json)')
-    attack_parser.add_argument('--type', default='evasion',
-                             choices=['evasion', 'poisoning'],
-                             help='Attack type')
-    attack_parser.add_argument('--config', default='config.yaml',
-                             help='Config file path')
-    
-    # predict command
-    predict_parser = subparsers.add_parser('predict', help='Get predictions for nodes')
-    predict_parser.add_argument('--model', required=True,
-                              help='Model name')
-    predict_parser.add_argument('--node-ids', nargs='+', type=int, required=True,
-                              help='Node IDs to predict')
-    predict_parser.add_argument('--dataset', default='etfd',
-                              help='Dataset name')
-    predict_parser.add_argument('--models-dir', default='models',
-                              help='Directory containing model files')
-    predict_parser.add_argument('--config', default='config.yaml',
-                              help='Config file path')
-    
-    # analyze command
-    analyze_parser = subparsers.add_parser('analyze', help='Analyze dataset')
-    analyze_parser.add_argument('--dataset', default='etfd',
-                              help='Dataset name')
-    analyze_parser.add_argument('--config', default='config.yaml',
-                              help='Config file path')
-    
-    args = parser.parse_args()
-    
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-    
-    # initialize system
-    config_path = getattr(args, 'config', 'config.yaml')
-    system = FraudDetectionSystem(config_path)
-    
-    # execute command
-    if args.command == 'train':
-        results = system.train(
-            models=args.models,
-            dataset=args.dataset,
-            model_type=args.type,
-            val_size=args.val_size,
-            test_size=args.test_size
-        )
-        
-    elif args.command == 'evaluate':
-        results = system.evaluate(
-            model_names=args.models,
-            dataset=args.dataset,
-            test_size=args.test_size,
-            models_dir=args.models_dir,
-            save_results=args.save_results
-        )
-        
-        # print summary
-        print("\nEvaluation Results:")
-        print("-" * 60)
-        for model_name, metrics in results.items():
-            if 'error' not in metrics:
-                print(f"{model_name}: F1={metrics['f1']:.4f}, AUC={metrics['auc']:.4f}")
-            else:
-                print(f"{model_name}: Error - {metrics['error']}")
-        
-    elif args.command == 'attack':
-        models = args.models if args.models else ([args.model] if args.model else ['GCN'])
-        evading_ids = args.evading_ids if args.evading_ids else ([args.target_node] if args.target_node else None)
-        
-        results = system.attack(
-            model=models[0] if len(models) == 1 else models,
-            dataset=args.dataset,
-            target_node=evading_ids[0] if evading_ids and len(evading_ids) == 1 else None,
-            models=models,
-            evading_ids=evading_ids,
-            main_initial_balance=args.main_initial_balance,
-            sybil_initial_balance=args.sybil_initial_balance,
-            max_balance_prop=args.max_balance_prop,
-            remove_exit=args.remove_exit,
-            p_detection_threshold=args.p_detection_threshold,
-            num_accounts=args.num_accounts,
-            num_steps=args.num_steps,
-            num_optim_steps=args.num_optim_steps,
-            p_evasion_threshold=args.p_evasion_threshold,
-            gas_penalty=args.gas_penalty,
-            save_results=args.save_results,
-            attack_type=args.type
-        )
-        
-    elif args.command == 'predict':
-        predictions = system.predict(
-            model_name=args.model,
-            node_ids=args.node_ids,
-            dataset=args.dataset,
-            models_dir=args.models_dir
-        )
-        for node_id, prob in zip(args.node_ids, predictions):
-            print(f"Node {node_id}: {prob:.4f}")
+            # compute statistics
+            results = {
+                'model': str(model_name),
+                'split': str(split),
+                'dataset': str(dataset),
+                'total_nodes': int(len(split_indices)),
+                'detected_scam_nodes': int(len(scam_indices)),
+                'attacked_nodes': int(len(attack_results)),
+                'successful_attacks': int(successful_attacks),
+                'attack_success_rate': float(successful_attacks / len(attack_results) if len(attack_results) > 0 else 0.0),
+                'avg_budget_used': float(avg_budget_used),
+                'avg_sybils_created': float(avg_sybils),
+                'avg_steps_taken': float(avg_steps),
+                'attack_config': {
+                    'max_budget_prop': float(attack_config.max_budget_prop),
+                    'p_evasion_threshold': float(attack_config.p_evasion_threshold),
+                    'max_transformations': int(attack_config.max_transformations),
+                    'max_sybils': int(attack_config.max_sybils)
+                },
+                'attacks': attack_results
+            }
             
-    elif args.command == 'analyze':
-        stats = system.analyze_dataset(dataset=args.dataset)
-        for key, value in stats.items():
-            print(f"{key}: {value}")
+            print(f"\n{'='*40}")
+            print(f"Attack Summary for {model_name}:")
+            print(f"  Total nodes in {split}: {len(split_indices)}")
+            print(f"  Detected scam nodes: {len(scam_indices)}")
+            print(f"  Attacked nodes: {len(attack_results)}")
+            print(f"  Successful attacks: {successful_attacks}/{len(attack_results)}")
+            print(f"  Success rate: {results['attack_success_rate']:.2%}")
+            if successful_results:
+                print(f"  Avg budget used: {avg_budget_used:.1%}")
+                print(f"  Avg sybils created: {avg_sybils:.1f}")
+                print(f"  Avg steps taken: {avg_steps:.1f}")
+        
+        # save results to JSON
+        output_file = results_dir / f"{model_name}.json"
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to {output_file}")
+
+def analyze(results_dir: str = 'results') -> pd.DataFrame:
+    """Analyze attack results from all models and create summary dataframe.
+
+    Args:
+        results_dir: Directory containing attack result JSON files
+
+    Returns:
+        DataFrame with comprehensive attack analysis
+    """
+    results_path = Path(results_dir)
+    if not results_path.exists():
+        print(f"Results directory {results_dir} not found")
+        return pd.DataFrame()
+
+    all_results = []
+
+    for json_file in results_path.glob("*.json"):
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+
+        model_name = data['model']
+        attacks = data.get('attacks', [])
+
+        # calculate statistics
+        successful_attacks = [a for a in attacks if a.get('success', False)]
+        num_successful = len(successful_attacks)
+        num_total = len(attacks)
+
+        if successful_attacks:
+            avg_budget_prop = np.mean([a['budget_spent_prop'] for a in successful_attacks])
+            avg_sybils = np.mean([a['sybils_created'] for a in successful_attacks])
+            avg_steps = np.mean([a['steps_taken'] for a in successful_attacks])
+            avg_prob_reduction = np.mean([
+                a['initial_prob'] - a['final_prob'] for a in successful_attacks
+            ])
+        else:
+            avg_budget_prop = avg_sybils = avg_steps = avg_prob_reduction = 0
+
+        all_results.append({
+            'model': model_name,
+            'split': data['split'],
+            'dataset': data['dataset'],
+            'total_nodes': data['total_nodes'],
+            'detected_scam': data['detected_scam_nodes'],
+            'attacked_nodes': num_total,
+            'successful_attacks': num_successful,
+            'attack_success_rate': num_successful / num_total if num_total > 0 else 0,
+            'avg_budget_prop': avg_budget_prop,
+            'avg_sybils': avg_sybils,
+            'avg_steps': avg_steps,
+            'avg_prob_reduction': avg_prob_reduction
+        })
+
+    df = pd.DataFrame(all_results)
+
+    if not df.empty:
+        print("\n" + "="*60)
+        print("Attack Analysis Summary")
+        print("="*60)
+        print(df.to_string(index=False))
+
+        # save to CSV
+        csv_path = results_path / "attack_analysis.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"\nAnalysis saved to {csv_path}")
+
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train and evaluate GNN models for fraud detection")
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    train_parser = subparsers.add_parser('train', help='Train models')
+    train_parser.add_argument('--models', nargs='+', default=['all'], 
+                            help='Models to train (GCN, GAT, GATv2, SAGE, Chebyshev, or all)')
+    train_parser.add_argument('--dataset', default='mtcga', help='Dataset to use')
+    train_parser.add_argument('--config', default='config.yaml', help='Config file path')
+    
+    eval_parser = subparsers.add_parser('evaluate', help='Evaluate models')
+    eval_parser.add_argument('--models', nargs='*', default=None,
+                           help='Models to evaluate (leave empty for all)')
+    eval_parser.add_argument('--dataset', default='mtcga', help='Dataset to use')
+    eval_parser.add_argument('--split', default='test', choices=['train', 'val', 'test'],
+                           help='Split to evaluate on')
+    eval_parser.add_argument('--config', default='config.yaml', help='Config file path')
+    
+    attack_parser = subparsers.add_parser('attack', help='Attack detected scam accounts')
+    attack_parser.add_argument('--models', nargs='*', default=None,
+                           help='Models to attack (leave empty for all)')
+    attack_parser.add_argument('--dataset', default='mtcga', help='Dataset to use')
+    attack_parser.add_argument('--split', default='test', choices=['train', 'val', 'test'],
+                           help='Split to attack on')
+    attack_parser.add_argument('--config', default='config.yaml', help='Config file path')
+    attack_parser.add_argument('--limit', type=int, default=None,
+                           help='Limit number of nodes to attack per model')
+
+    analyze_parser = subparsers.add_parser('analyze', help='Analyze attack results')
+    analyze_parser.add_argument('--results', default='results', help='Results directory')
+    
+    args = parser.parse_args()
+    
+    if args.command == 'train':
+        train(args.models, args.dataset, args.config)
+    elif args.command == 'evaluate':
+        evaluate(args.models, args.dataset, args.split, args.config)
+    elif args.command == 'attack':
+        attack(args.models, args.dataset, args.split, args.config, args.limit)
+    elif args.command == 'analyze':
+        analyze(args.results)
+    else:
+        parser.print_help()

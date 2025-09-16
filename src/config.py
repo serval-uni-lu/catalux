@@ -1,15 +1,11 @@
 import yaml
 import torch
-
 from pathlib import Path
-from typing import Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
 
 @dataclass
 class Config:
-    """Configuration class."""
-    
-    # general training
     num_classes: int = 2
     lr: float = 5e-3
     epochs: int = 250
@@ -19,52 +15,37 @@ class Config:
     device: str = "auto"
     seed: int = 42
     
-    # architecture parameters
     layers: int = 2
     hidden_units: int = 256
     use_batch_norm: bool = False
-
-    # model-specific configs
+    
+    val_size: float = 0.1
+    test_size: float = 0.2
+    
     gat_heads: int = 4
     gat_dropout: float = 0.2
     gatv2_heads: int = 4
     gatv2_dropout: float = 0.2
-    cheb_k: list[int] = [2, 3]
+    cheb_k: list[int] = field(default_factory=lambda: [2, 3])
     
-    # additional optimization parameters
-    gradient_clipping: float = 1.0
     scheduler_patience: int = 10
     scheduler_factor: float = 0.7
-    
-    # model selection criteria
-    primary_metric: str = "f1"
-    secondary_metric: str = "recall"
-    min_recall_threshold: float = 0.80
-    
-    # tabular model parameters
-    # RealMLP
-    realmlp_lr: float = 0.001
-    realmlp_layers: int = 4
-    realmlp_hidden: int = 512
-    realmlp_dropout: float = 0.25
-    realmlp_batch_size: int = 256
-    realmlp_weight_decay: float = 0.00001
-    
-    # TabM
-    tabm_blocks: int = 3
-    tabm_d_block: int = 384
-    tabm_k: int = 16
-    tabm_dropout: float = 0.12
-    tabm_lr: float = 0.002
-    tabm_batch_size: int = 256
-    tabm_weight_decay: float = 0.0001
+
+    p_evasion_threshold: float = 0.5
+    gas_penalty_coef: float = 0.1
+    value_penalty_coef: float = 0.01
+    max_budget_prop: float = 0.4
+    max_sybils: int = 5
+    num_optim_steps: int = 100
+    max_transformations: int = 10
+    maxiter: int = 100
+    vol_tol: float = 1e-10
+    len_tol: float = 1e-6
     
     def __post_init__(self) -> None:
-        """Set default for mutable fields and validate configuration."""            
         if self.device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        # validation
         if self.lr <= 0:
             raise ValueError("Learning rate must be positive")
         if self.hidden_units <= 0:
@@ -75,12 +56,13 @@ class Config:
             raise ValueError("Number of layers must be at least 1")
         if self.gat_heads < 1:
             raise ValueError("Number of GAT heads must be at least 1")
-        if self.min_recall_threshold < 0 or self.min_recall_threshold > 1:
-            raise ValueError("Minimum recall threshold must be between 0 and 1")
+        if self.val_size < 0 or self.val_size > 1:
+            raise ValueError("Validation size must be between 0 and 1")
+        if self.test_size < 0 or self.test_size > 1:
+            raise ValueError("Test size must be between 0 and 1")
     
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':
-        """Load configuration from YAML file."""
         config = cls()
         
         if Path(path).exists():
@@ -90,49 +72,13 @@ class Config:
             for key, value in yaml_data.items():
                 if hasattr(config, key):
                     setattr(config, key, value)
-                else:
-                    print(f"Warning: Unknown parameter '{key}' in config file")
         
         return config
     
     def get_device(self) -> torch.device:
-        """Get torch device."""
         if self.device == "auto":
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             device = torch.device(self.device)
         
         return device
-    
-    def get_model_specific_params(self, model_name: str) -> Dict[str, Any]:
-        """Get model-specific parameters.
-        
-        Args:
-            model_name: Name of the model to get parameters for
-            
-        Returns:
-            Dictionary containing model-specific configuration parameters
-        """
-        base_params = {
-            'hidden_units': self.hidden_units,
-            'dropout': self.dropout,
-            'layers': self.layers,
-            'use_batch_norm': self.use_batch_norm
-        }
-        
-        if model_name in ['GAT']:
-            base_params.update({
-                'gat_heads': self.gat_heads,
-                'gat_dropout': self.gat_dropout
-            })
-        elif model_name in ['GATv2']:
-            base_params.update({
-                'gatv2_heads': self.gatv2_heads,
-                'gatv2_dropout': self.gatv2_dropout
-            })
-        elif model_name in ['Chebyshev']:
-            base_params.update({
-                'cheb_k': self.cheb_k
-            })
-        
-        return base_params

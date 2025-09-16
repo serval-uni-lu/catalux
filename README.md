@@ -1,74 +1,84 @@
-# CATALux
+# CATALux Budget
 
-A simple framework for training and evaluating Graph Neural Network (GNN) models on custom graph datasets.
+A framework for training GNN models for fraud detection and evaluating their robustness against adversarial attacks.
 
 ## Project Structure
 
 ```
-catalux/
+catalux-budget/
 ├─ data/
-│  ├─ etfd/dataset.csv
-│  └─ ammari/dataset.csv
-├─ main.py
+├─ models/
+├─ results/
 ├─ src/
+│  ├─ attack.py
+│  ├─ config.py
+│  ├─ dataloader.py
+│  ├─ graph.py
 │  ├─ models.py
-│  ├─ utils.py
+│  ├─ predict.py
 │  ├─ train.py
-│  └─ loader.py
+│  └─ utils.py
 ├─ config.yaml
-├─ requirements.txt
+├─ main.py
 └─ README.md
 ```
 
 ## Features
 
-- Supports multiple datasets (`ammari`, `etfd`)
-- Cross-validation and single-run modes
-- Easily configurable via config.yaml
-- Results saved to CSV
+- Train GNN models (GCN, GAT, GATv2, SAGE, Chebyshev) for fraud detection
+- Evaluate model performance on test data
+- Execute Multi-Target Constrained Graph Attacks (MTCGA) on detected fraud nodes
+- Analyze attack success rates and resource usage
+- Configurable via config.yaml
 
 ## Quick Start
 
-1. **Install dependencies**  
-   ```
-   pip install -r requirements.txt
-   ```
-
-2. **Prepare data**  
-   Place your dataset CSVs in data/ammari/dataset.csv or data/etfd/dataset.csv.
-
-3. **Configure settings**  
-   Edit config.yaml to adjust model and training parameters.
-
-4. **Run training**  
-   ```
-   python main.py --dataset ammari
-   ```
-   or
-   ```
-   python main.py --dataset etfd
+1. **Install dependencies**
+   ```bash
+   uv pip install -r requirements.txt
    ```
 
-5. **Results**  
-   Results are saved in the `results/` directory as a CSV file.
+2. **Train models**
+   ```bash
+   uv run python main.py train --models all --dataset mtcga
+   ```
 
-## Configuration (config.yaml)
+3. **Evaluate models**
+   ```bash
+   uv run python main.py evaluate --models GCN GAT --split test
+   ```
 
-Example:
+4. **Attack detected fraud nodes**
+   ```bash
+   uv run python main.py attack --models Chebyshev --split test --limit 10
+   ```
+
+5. **Analyze attack results**
+   ```bash
+   uv run python main.py analyze --results results
+   ```
+
+## Commands
+
+- `train` - Train GNN models on fraud detection dataset
+- `evaluate` - Evaluate trained models on specified data split
+- `attack` - Execute adversarial attacks on detected fraud nodes
+- `analyze` - Generate summary statistics from attack results
+
+## Configuration
+
+Key parameters in `config.yaml`:
+
 ```yaml
-num_classes: 2
-hidden_units: 128
-chebyshev_k: [1, 2]
-lr: 9e-3
-epochs: 3000
-weight_decay: 5e-4
-early_stopping_patience: 100
-num_folds: 5
-device: auto
-seed: 42
+# Model training
+lr: 0.005
+epochs: 250
+hidden_units: 256
+
+# Attack parameters
+p_evasion_threshold: 0.5
+max_budget_prop: 0.4
+max_transformations: 10
+gas_penalty_coef: 0.1
+value_penalty_coef: 0.01
 ```
-
-## Requirements
-
-- Python 3.8+
-- See requirements.txt for package dependencies

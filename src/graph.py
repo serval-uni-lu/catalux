@@ -113,7 +113,7 @@ class Graph:
     
     def add_node(self, features: Optional[torch.Tensor] = None) -> int:
         """
-        Add a single node to the graph with optimized memory usage.
+        Add a single node to the graph.
         
         Args:
             features: Node features (optional). If None, uses zeros.
