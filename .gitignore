@@ -1,7 +1,7 @@
 # directories
 /__pycache__
 /.venv
-/data
+# /data
 /plots
 /models
 /results
