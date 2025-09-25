@@ -1,11 +1,11 @@
-# CATALux
+# Multi-Target Constrained Graph Attack
 
 A framework for training GNN models for fraud detection and evaluating their robustness against adversarial attacks.
 
 ## Project Structure
 
 ```
-catalux-budget/
+project/
 ├─ data/
 ├─ models/
 ├─ results/
