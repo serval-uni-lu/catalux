@@ -1,4 +1,4 @@
-# CATALux Budget
+# CATALux
 
 A framework for training GNN models for fraud detection and evaluating their robustness against adversarial attacks.
 
